@@ -2,6 +2,7 @@ import AppKit
 import CoreGraphics
 import Foundation
 import MirrorKit
+import Vision
 
 // MARK: - small argument parser
 
@@ -99,10 +100,18 @@ func resolveAim(_ x: Double, _ y: Double, space: String,
     return Aim(screen: screen, imagePoint: imagePoint, normX: nx, normY: ny, rect: rect)
 }
 
+func recordTap(_ aim: Aim, _ frame: MirrorFrame, _ d: DisplayDetection) {
+    LastTap.save(LastTap(normX: aim.normX, normY: aim.normY,
+                         screenX: aim.screen.x, screenY: aim.screen.y,
+                         windowWidth: frame.status.width, windowHeight: frame.status.height,
+                         displayWidth: d.rect.width, displayHeight: d.rect.height))
+}
+
 func renderAim(_ frame: MirrorFrame, _ detection: DisplayDetection, aim: Aim, out: URL,
                ocrHits: [OCRHit] = [], drawOCR: Bool = false) {
     var opts = AnnotateOptions()
     opts.crosshair = (aim.normX, aim.normY)
+    if let lt = LastTap.load(maxAge: 600) { opts.lastTap = (lt.normX, lt.normY) }
     opts.ocrHits = ocrHits
     opts.drawOCRHits = drawOCR
     opts.footer = String(format: "target %.1f%%, %.1f%%  screen (%.1f, %.1f)  display %@",
@@ -154,6 +163,9 @@ func cmdCapture(_ args: Args) {
     let d = Display.resolve(for: frame)
     var opts = AnnotateOptions()
     opts.drawGrid = !args.has("no-grid")
+    if !args.has("no-last"), let lt = LastTap.load(maxAge: 600) {
+        opts.lastTap = (lt.normX, lt.normY)
+    }
     if let f = args.value("footer") { opts.footer = f }
     if args.has("ocr") || args.has("ocr-boxes") {
         let crop = frame.bitmap.cropped(to: d.rect)
@@ -196,6 +208,7 @@ func cmdClick(_ args: Args) {
     let before = frame.bitmap
     let beforeDate = frame.fileDate
     Input.click(at: aim.screen, doubleClick: args.has("double"), holdMs: Int(args.value("hold") ?? "90") ?? 90)
+    recordTap(aim, frame, d)
     print(String(format: "clicked %.2f%%, %.2f%% at screen (%.1f, %.1f)", aim.normX * 100, aim.normY * 100, aim.screen.x, aim.screen.y))
 
     if args.has("verify") {
@@ -233,6 +246,20 @@ func cmdDrag(_ args: Args) {
     let dur = Int(args.value("duration") ?? "280") ?? 280
     Input.drag(from: a.screen, to: b.screen, durationMs: dur)
     print(String(format: "dragged (%.1f, %.1f) -> (%.1f, %.1f) in %dms", a.screen.x, a.screen.y, b.screen.x, b.screen.y, dur))
+}
+
+func cmdScroll(_ args: Args) {
+    guard args.positional.count >= 3, let x = Double(args.positional[0]),
+          let y = Double(args.positional[1]), let lines = Int32(args.positional[2]) else {
+        fail("usage: mirrorctl scroll <x> <y> <lines> [--space norm|px|screen]")
+    }
+    let space = args.value("space") ?? "norm"
+    let frame = loadFrame()
+    let d = Display.resolve(for: frame)
+    let aim = resolveAim(x, y, space: space, frame: frame, detection: d)
+    Helper.activateMirror()
+    Input.scroll(at: aim.screen, lines: lines)
+    print("scrolled \(lines) lines at (\(x), \(y))")
 }
 
 func cmdMove(_ args: Args) {
@@ -278,7 +305,7 @@ func ocrHitsForFrame(_ frame: MirrorFrame, _ d: DisplayDetection, args: Args) ->
     let crop = frame.bitmap.cropped(to: d.rect)
     guard let cg = crop.cgImage() else { return [] }
     let langs = (args.value("lang") ?? "zh-Hans,en-US").split(separator: ",").map(String.init)
-    return (try? OCR.recognize(cgImage: cg, languages: langs)) ?? []
+    return (try? OCR.recognize(cgImage: cg, languages: langs, level: ocrLevel(args))) ?? []
 }
 
 func cmdOCR(_ args: Args) {
@@ -321,6 +348,144 @@ func cmdFind(_ args: Args) {
     }
 }
 
+func ocrLevel(_ args: Args) -> VNRequestTextRecognitionLevel {
+    args.has("fast") ? .fast : .accurate
+}
+
+func waitForText(_ needle: String, args: Args, click: Bool = false) -> Bool {
+    let timeout = Double(args.value("timeout") ?? "15") ?? 15
+    let interval = Double(args.value("interval") ?? "0.35") ?? 0.35
+    let index = Int(args.value("index") ?? "0") ?? 0
+    let deadline = Date().addingTimeInterval(timeout)
+    var lastTS = Double.nan
+    while Date() < deadline {
+        if let st = HelperStatus(), st.ts == lastTS {
+            Thread.sleep(forTimeInterval: min(interval, 0.2))
+            continue
+        }
+        let frame = loadFrame()
+        guard frame.status.ts != lastTS else {
+            Thread.sleep(forTimeInterval: min(interval, 0.2))
+            continue
+        }
+        lastTS = frame.status.ts
+        let d = Display.resolve(for: frame)
+        let crop = frame.bitmap.cropped(to: d.rect)
+        guard let cg = crop.cgImage() else { continue }
+        let langs = (args.value("lang") ?? "zh-Hans,en-US").split(separator: ",").map(String.init)
+        let hits = (try? OCR.recognize(cgImage: cg, languages: langs, level: ocrLevel(args))) ?? []
+        let matches = hits.filter {
+            args.has("exact") ? $0.text == needle : $0.text.localizedCaseInsensitiveContains(needle)
+        }
+        if matches.count > index {
+            let m = matches[index]
+            print(String(format: "found \"%@\" at %.1f%%, %.1f%%", m.text, m.centerX * 100, m.centerY * 100))
+            if click {
+                let aim = resolveAim(m.centerX * 100, m.centerY * 100, space: "norm", frame: frame, detection: d)
+                Helper.activateMirror()
+                Input.click(at: aim.screen, doubleClick: args.has("double"))
+                recordTap(aim, frame, d)
+                print(String(format: "clicked at screen (%.1f, %.1f)", aim.screen.x, aim.screen.y))
+                if args.has("verify") {
+                    Thread.sleep(forTimeInterval: 0.8)
+                    if let after = try? Helper.waitForFreshFrame(after: frame.fileDate, timeout: 3.0) {
+                        let d2 = Display.resolve(for: after)
+                        let ratio = Diff.ratio(frame.bitmap, after.bitmap,
+                                               region: bestRegion(d2.rect, frame.bitmap, after.bitmap))
+                        print(String(format: "screen diff %.2f%%%@", ratio * 100,
+                                     ratio < 0.003 ? "  (looks unchanged — tap may have missed)" : ""))
+                    }
+                }
+            }
+            return true
+        }
+        Thread.sleep(forTimeInterval: interval)
+    }
+    print("text not found within \(Int(timeout))s: \(needle)")
+    return false
+}
+
+func cmdWaitAny(_ args: Args) {
+    guard !args.positional.isEmpty else {
+        fail("usage: mirrorctl wait-any <text...> [--click] [--timeout s] [--interval s] [--verify]")
+    }
+    let needles = args.positional
+    let timeout = Double(args.value("timeout") ?? "25") ?? 25
+    let interval = Double(args.value("interval") ?? "0.5") ?? 0.5
+    let deadline = Date().addingTimeInterval(timeout)
+    var lastTS = Double.nan
+    while Date() < deadline {
+        if let st = HelperStatus(), st.ts == lastTS {
+            Thread.sleep(forTimeInterval: min(interval, 0.2))
+            continue
+        }
+        let frame = loadFrame()
+        guard frame.status.ts != lastTS else {
+            Thread.sleep(forTimeInterval: min(interval, 0.2))
+            continue
+        }
+        lastTS = frame.status.ts
+        let d = Display.resolve(for: frame)
+        let crop = frame.bitmap.cropped(to: d.rect)
+        guard let cg = crop.cgImage() else { continue }
+        let langs = (args.value("lang") ?? "zh-Hans,en-US").split(separator: ",").map(String.init)
+        let hits = (try? OCR.recognize(cgImage: cg, languages: langs, level: ocrLevel(args))) ?? []
+        for needle in needles {
+            if let m = hits.first(where: { $0.text.localizedCaseInsensitiveContains(needle) }) {
+                print(String(format: "found \"%@\" (wanted %@) at %.1f%%, %.1f%%",
+                             m.text, needle, m.centerX * 100, m.centerY * 100))
+                if args.has("click") {
+                    let aim = resolveAim(m.centerX * 100, m.centerY * 100, space: "norm", frame: frame, detection: d)
+                    Helper.activateMirror()
+                    Input.click(at: aim.screen, doubleClick: args.has("double"))
+                    recordTap(aim, frame, d)
+                    print(String(format: "clicked at screen (%.1f, %.1f)", aim.screen.x, aim.screen.y))
+                    if args.has("verify") {
+                        Thread.sleep(forTimeInterval: 0.8)
+                        if let after = try? Helper.waitForFreshFrame(after: frame.fileDate, timeout: 3.0) {
+                            let d2 = Display.resolve(for: after)
+                            let ratio = Diff.ratio(frame.bitmap, after.bitmap,
+                                                   region: bestRegion(d2.rect, frame.bitmap, after.bitmap))
+                            print(String(format: "screen diff %.2f%%", ratio * 100))
+                        }
+                    }
+                }
+                return
+            }
+        }
+        Thread.sleep(forTimeInterval: interval)
+    }
+    print("none of the texts appeared within \(Int(timeout))s: \(needles.joined(separator: ", "))")
+    exit(2)
+}
+
+func cmdWaitText(_ args: Args) {
+    guard let needle = args.positional.first else {
+        fail("usage: mirrorctl wait-text <text> [--click] [--timeout s] [--interval s] [--fast] [--verify]")
+    }
+    if !waitForText(needle, args: args, click: args.has("click")) {
+        exit(2)
+    }
+}
+
+func cmdCollect(_ args: Args) {
+    // Wait for the reward button, tap it, then tap the accept button in the popup.
+    let claim = args.value("claim") ?? "去领取"
+    let accept = args.value("accept") ?? "开心收下"
+    let timeout = args.value("timeout") ?? "8"
+    var a = Args([], valueFlags: ["timeout", "interval", "index", "lang"])
+    a.values["timeout"] = timeout
+    if args.has("fast") { a.flags.insert("fast") }
+    if !waitForText(claim, args: a, click: true) { exit(2) }
+    Thread.sleep(forTimeInterval: 0.4)
+    var b = Args([], valueFlags: ["timeout", "interval", "index", "lang"])
+    b.values["timeout"] = timeout
+    if args.has("fast") { b.flags.insert("fast") }
+    if !waitForText(accept, args: b, click: true) { exit(2) }
+    Thread.sleep(forTimeInterval: 0.8)
+    print("reward collected")
+}
+
 func cmdClickText(_ args: Args) {
     guard let needle = args.positional.first else { fail("usage: mirrorctl click-text <text> [--index n]") }
     let index = Int(args.value("index") ?? "0") ?? 0
@@ -342,6 +507,7 @@ func cmdClickText(_ args: Args) {
     Helper.activateMirror()
     let beforeDate = frame.fileDate
     Input.click(at: aim.screen, doubleClick: args.has("double"))
+    recordTap(aim, frame, d)
     print(String(format: "clicked \"%@\" at %.1f%%, %.1f%%", m.text, m.centerX * 100, m.centerY * 100))
     if args.has("verify") {
         Thread.sleep(forTimeInterval: 1.0)
@@ -424,7 +590,13 @@ Commands:
                                                     tap; norm space is 0..100 percent
   click-text <text> [--index n] [--dry-run] [--verify]
                                                     OCR + tap the matching text
+  wait-text <text> [--click] [--timeout s] [--fast] [--verify]
+                                                    poll OCR until text appears, optionally tap
+  wait-any <text...> [--click] [--timeout s] [--verify]
+                                                    poll until any of the texts appears
+  collect [--claim 去领取] [--accept 开心收下]        tap claim button, then accept popup
   drag <x1> <y1> <x2> <y2> [--duration ms] [--space ...]
+  scroll <x> <y> <lines> [--space ...]              wheel scroll (negative = down)
   move <x> <y> [--space ...]                        hover the Mac cursor
   key <keycode> [cmd] [shift] [opt] [ctrl]
   text <string>
@@ -441,14 +613,19 @@ guard let command = raw.first else {
     print(usage); exit(0)
 }
 let rest = Array(raw.dropFirst())
-let args = Args(rest, valueFlags: ["space", "out", "duration", "index", "lang", "footer", "hold"])
+let args = Args(rest, valueFlags: ["space", "out", "duration", "index", "lang", "footer", "hold",
+                                   "timeout", "interval", "claim", "accept"])
 
 switch command {
 case "status": cmdStatus(args)
 case "capture", "shot": cmdCapture(args)
 case "click", "tap": cmdClick(args)
 case "click-text": cmdClickText(args)
+case "wait-text": cmdWaitText(args)
+case "wait-any": cmdWaitAny(args)
+case "collect": cmdCollect(args)
 case "drag": cmdDrag(args)
+case "scroll": cmdScroll(args)
 case "move": cmdMove(args)
 case "key": cmdKey(args)
 case "text": cmdText(args)

@@ -6,6 +6,7 @@ import Foundation
 public struct AnnotateOptions {
     public var drawGrid = true
     public var crosshair: (normX: Double, normY: Double)? = nil
+    public var lastTap: (normX: Double, normY: Double)? = nil
     public var ocrHits: [OCRHit] = []
     public var drawOCRHits = false
     public var footer: String? = nil
@@ -55,10 +56,20 @@ public enum Annotate {
             drawOCRBoxes(ctx: ctx, imageRect: imageRect, hits: options.ocrHits)
         }
 
+        if let lt = options.lastTap {
+            let p = CGPoint(x: imageRect.minX + imageRect.width * lt.normX,
+                            y: imageRect.minY + imageRect.height * (1 - lt.normY))
+            drawMarker(ctx: ctx, at: p,
+                       label: String(format: "last tap %.1f%%, %.1f%%", lt.normX * 100, lt.normY * 100),
+                       color: CGColor(red: 0.0, green: 0.45, blue: 1.0, alpha: 1.0), radius: 15)
+        }
+
         if let ch = options.crosshair {
             let p = CGPoint(x: imageRect.minX + imageRect.width * ch.normX,
                             y: imageRect.minY + imageRect.height * (1 - ch.normY))
-            drawCrosshair(ctx: ctx, at: p, label: String(format: "aim %.1f%%, %.1f%%", ch.normX * 100, ch.normY * 100))
+            drawMarker(ctx: ctx, at: p,
+                       label: String(format: "aim %.1f%%, %.1f%%", ch.normX * 100, ch.normY * 100),
+                       color: CGColor(red: 1.0, green: 0.1, blue: 0.2, alpha: 1.0), radius: 24)
         }
 
         if let footer = options.footer {
@@ -112,6 +123,13 @@ public enum Annotate {
             drawText(pct, ctx: ctx, x: Double(imageRect.minX) - 8, baseline: Double(y) - 6, size: 17,
                      color: labelColor, anchor: .right)
         }
+
+        // Axis titles, so screenshots are self-describing.
+        let axisColor = NSColor(calibratedRed: 0.35, green: 0.35, blue: 0.40, alpha: 1)
+        drawText("y (%)", ctx: ctx, x: 6, baseline: Double(imageRect.maxY) + 30, size: 13,
+                 color: axisColor, anchor: .left)
+        drawText("x (%)", ctx: ctx, x: Double(imageRect.maxX), baseline: Double(imageRect.maxY) + 30,
+                 size: 13, color: axisColor, anchor: .right)
     }
 
     private static func drawOCRBoxes(ctx: CGContext, imageRect: CGRect, hits: [OCRHit]) {
@@ -126,40 +144,39 @@ public enum Annotate {
         }
     }
 
-    private static func drawCrosshair(ctx: CGContext, at p: CGPoint, label: String) {
-        let r: CGFloat = 24
-        ctx.setFillColor(CGColor(red: 1, green: 0.1, blue: 0.2, alpha: 0.18))
+    private static func drawMarker(ctx: CGContext, at p: CGPoint, label: String,
+                                   color: CGColor, radius: CGFloat) {
+        let r = radius
+        ctx.setFillColor(color.copy(alpha: 0.16) ?? color)
         ctx.fillEllipse(in: CGRect(x: p.x - r, y: p.y - r, width: r * 2, height: r * 2))
-        ctx.setStrokeColor(CGColor(red: 1, green: 0.1, blue: 0.2, alpha: 1))
+        ctx.setStrokeColor(color)
         ctx.setLineWidth(3)
         ctx.strokeEllipse(in: CGRect(x: p.x - r, y: p.y - r, width: r * 2, height: r * 2))
         ctx.setLineWidth(2)
-        ctx.move(to: CGPoint(x: p.x - r - 14, y: p.y))
-        ctx.addLine(to: CGPoint(x: p.x + r + 14, y: p.y))
-        ctx.move(to: CGPoint(x: p.x, y: p.y - r - 14))
-        ctx.addLine(to: CGPoint(x: p.x, y: p.y + r + 14))
+        ctx.move(to: CGPoint(x: p.x - r - 12, y: p.y))
+        ctx.addLine(to: CGPoint(x: p.x + r + 12, y: p.y))
+        ctx.move(to: CGPoint(x: p.x, y: p.y - r - 12))
+        ctx.addLine(to: CGPoint(x: p.x, y: p.y + r + 12))
         ctx.strokePath()
 
-        // Label with a white pill background above the crosshair.
-        let text = label
-        let size: CGFloat = 16
+        // Label with a white pill background above the marker.
+        let size: CGFloat = 15
         let font = CTFontCreateWithName("Helvetica-Bold" as CFString, size, nil)
-        let attrs: [NSAttributedString.Key: Any] = [
-            .font: font,
-            .foregroundColor: NSColor(calibratedRed: 0.8, green: 0.0, blue: 0.1, alpha: 1),
-        ]
-        let line = CTLineCreateWithAttributedString(NSAttributedString(string: text, attributes: attrs))
+        let nsColor = NSColor(cgColor: color) ?? NSColor.red
+        let attrs: [NSAttributedString.Key: Any] = [.font: font, .foregroundColor: nsColor]
+        let line = CTLineCreateWithAttributedString(NSAttributedString(string: label, attributes: attrs))
         var ascent: CGFloat = 0, descent: CGFloat = 0, leading: CGFloat = 0
         let width = CTLineGetTypographicBounds(line, &ascent, &descent, &leading)
         let pad: CGFloat = 6
-        let bx = min(max(4, p.x - CGFloat(width) / 2 - pad), ctx.width == 0 ? p.x : CGFloat(ctx.width) - CGFloat(width) - 2 * pad - 4)
-        let by = p.y + r + 10
+        let bx = min(max(4, p.x - CGFloat(width) / 2 - pad),
+                     CGFloat(ctx.width) - CGFloat(width) - 2 * pad - 4)
+        let by = p.y + r + 8
         let box = CGRect(x: bx, y: by, width: CGFloat(width) + pad * 2, height: ascent + descent + 6)
         let path = CGPath(roundedRect: box, cornerWidth: 6, cornerHeight: 6, transform: nil)
         ctx.setFillColor(CGColor(red: 1, green: 1, blue: 1, alpha: 0.92))
         ctx.addPath(path)
         ctx.fillPath()
-        ctx.setFillColor(CGColor(red: 0.8, green: 0, blue: 0.1, alpha: 1))
+        ctx.setFillColor(color)
         ctx.textPosition = CGPoint(x: box.minX + pad, y: box.minY + descent + 3)
         CTLineDraw(line, ctx)
     }

@@ -57,8 +57,17 @@ mirrorctl calibrate --save        # 检测显示屏矩形并保存标定
 - 状态：`.../status.json`
 - 标注截图：`.../annotated.png`，瞄准图：`.../aim.png`
 - 标定：`~/Library/Application Support/iPhoneMirror/calibration.json`
+- 最近一次点击：`~/Library/Application Support/iPhoneMirror/last-tap.json`
+  （`capture` 会在截图上用蓝色标记画出上次点击位置，便于校准）
 
 可用环境变量：`MIRROR_CAPTURE_DIR`、`MIRROR_HELPER_APP`。
+
+## Skills
+
+仓库内附了两份可复用的操作手册（Claude Code skill 格式）：
+
+- `.claude/skills/iphone-mirror-control/SKILL.md`：工具、坐标轴、校准、排错。
+- `.claude/skills/alipay-pay-reward-browse-tasks/SKILL.md`：支付宝「支付有礼 → 做任务领红包」浏览任务的完整流程、坐标与坑。
 
 ## 实现要点
 

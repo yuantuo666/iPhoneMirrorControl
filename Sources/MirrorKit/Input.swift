@@ -39,7 +39,7 @@ public enum Input {
         usleep(70_000)
         CGEvent(mouseEventSource: src, mouseType: .leftMouseDown, mouseCursorPosition: a, mouseButton: .left)?
             .post(tap: .cghidEventTap)
-        usleep(25_000)
+        usleep(120_000)
         for i in 1...steps {
             let t = Double(i) / Double(steps)
             let p = CGPoint(x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t)
@@ -50,6 +50,16 @@ public enum Input {
         usleep(20_000)
         CGEvent(mouseEventSource: src, mouseType: .leftMouseUp, mouseCursorPosition: b, mouseButton: .left)?
             .post(tap: .cghidEventTap)
+    }
+
+    public static func scroll(at p: CGPoint, lines: Int32) {
+        warp(to: p)
+        usleep(40_000)
+        if let e = CGEvent(scrollWheelEvent2Source: nil, units: .line, wheelCount: 1,
+                           wheel1: lines, wheel2: 0, wheel3: 0) {
+            e.location = p
+            e.post(tap: .cghidEventTap)
+        }
     }
 
     public static func type(text: String) {
